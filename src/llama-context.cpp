@@ -570,10 +570,16 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 
     if (cparams.auto_fhc) {
-        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
-        resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
-        resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
-        resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        if (model.arch == LLM_ARCH_DEEPSEEK4) {
+            LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
+            resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
+            resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
+            resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        } else {
+            cparams.fused_dsv4_hc_pre  = false;
+            cparams.fused_dsv4_hc_comb = false;
+            cparams.fused_dsv4_hc_post = false;
+        }
         cparams.auto_fhc = false;
     }
 }
