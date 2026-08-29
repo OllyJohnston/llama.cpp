@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <thread>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -729,50 +730,59 @@ bool llama_mmap::contains(const void * ptr, size_t len) const {
 
 void llama_mmap::prefetch_rows(const void * base, size_t stride, size_t row_size,
                                const int32_t * rows, size_t n_rows) const {
-#if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
-    const size_t base_off = (const char *) base - (const char *) pimpl->addr;
-    const auto ranges = llama_mmap_row_pages(base_off, stride, row_size, pimpl->size,
-                                             rows, n_rows, llama_mmap_page_size());
-#endif
-
-#if defined(_POSIX_MAPPED_FILES)
-    for (const auto & range : ranges) {
-        // unchecked: a failed hint only costs the fault it would have avoided
-        posix_madvise((char *) pimpl->addr + range.first, range.second - range.first,
-                      POSIX_MADV_WILLNEED);
-    }
-#elif defined(_WIN32)
-    #if _WIN32_WINNT >= 0x602
-    // PrefetchVirtualMemory takes all ranges in one call, which is the batching we want
-    BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
-    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-
-    pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
-    if (!pPrefetchVirtualMemory) {
+    if (base == nullptr || n_rows == 0 || pimpl->addr == nullptr) {
         return;
     }
 
-    std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-    entries.reserve(ranges.size());
-    for (const auto & range : ranges) {
-        WIN32_MEMORY_RANGE_ENTRY e;
-        e.VirtualAddress = (char *) pimpl->addr + range.first;
-        e.NumberOfBytes  = (SIZE_T) (range.second - range.first);
-        entries.push_back(e);
-    }
+    std::vector<int32_t> rows_vec(rows, rows + n_rows);
+    const void * map_addr = pimpl->addr;
+    const size_t map_size = pimpl->size;
 
-    if (!entries.empty()) {
-        // unchecked, same as the POSIX branch
-        pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0);
-    }
-    #endif
-#else
-    GGML_UNUSED(base);
-    GGML_UNUSED(stride);
-    GGML_UNUSED(row_size);
-    GGML_UNUSED(rows);
-    GGML_UNUSED(n_rows);
+    std::thread([map_addr, map_size, base, stride, row_size, rows_copy = std::move(rows_vec)]() {
+#if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
+        const size_t base_off = (const char *) base - (const char *) map_addr;
+        const auto ranges = llama_mmap_row_pages(base_off, stride, row_size, map_size,
+                                                 rows_copy.data(), rows_copy.size(), llama_mmap_page_size());
 #endif
+
+#if defined(_POSIX_MAPPED_FILES)
+        for (const auto & range : ranges) {
+            posix_madvise((char *) map_addr + range.first, range.second - range.first,
+                          POSIX_MADV_WILLNEED);
+        }
+#elif defined(_WIN32)
+        #if _WIN32_WINNT >= 0x602
+        BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKernel32) {
+            pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
+            if (pPrefetchVirtualMemory) {
+                std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+                entries.reserve(ranges.size());
+                for (const auto & range : ranges) {
+                    WIN32_MEMORY_RANGE_ENTRY e;
+                    e.VirtualAddress = (char *) map_addr + range.first;
+                    e.NumberOfBytes  = (SIZE_T) (range.second - range.first);
+                    entries.push_back(e);
+                }
+                if (!entries.empty()) {
+                    pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0);
+                }
+            }
+        }
+        #endif
+#endif
+        // Touch the row headers to ensure page tables are committed and resident in CPU cache
+        for (size_t i = 0; i < rows_copy.size(); ++i) {
+            if (rows_copy[i] >= 0) {
+                const char * r_ptr = (const char *) base + (size_t) rows_copy[i] * stride;
+                if (r_ptr >= (const char *) map_addr && r_ptr + row_size <= (const char *) map_addr + map_size) {
+                    volatile char dummy = *r_ptr;
+                    (void) dummy;
+                }
+            }
+        }
+    }).detach();
 }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
