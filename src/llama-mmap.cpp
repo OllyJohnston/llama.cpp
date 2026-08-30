@@ -734,55 +734,42 @@ void llama_mmap::prefetch_rows(const void * base, size_t stride, size_t row_size
         return;
     }
 
-    std::vector<int32_t> rows_vec(rows, rows + n_rows);
     const void * map_addr = pimpl->addr;
     const size_t map_size = pimpl->size;
 
-    std::thread([map_addr, map_size, base, stride, row_size, rows_copy = std::move(rows_vec)]() {
 #if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
-        const size_t base_off = (const char *) base - (const char *) map_addr;
-        const auto ranges = llama_mmap_row_pages(base_off, stride, row_size, map_size,
-                                                 rows_copy.data(), rows_copy.size(), llama_mmap_page_size());
+    const size_t base_off = (const char *) base - (const char *) map_addr;
+    const auto ranges = llama_mmap_row_pages(base_off, stride, row_size, map_size,
+                                             rows, n_rows, llama_mmap_page_size());
 #endif
 
 #if defined(_POSIX_MAPPED_FILES)
-        for (const auto & range : ranges) {
-            posix_madvise((char *) map_addr + range.first, range.second - range.first,
-                          POSIX_MADV_WILLNEED);
-        }
+    for (const auto & range : ranges) {
+        posix_madvise((char *) map_addr + range.first, range.second - range.first,
+                      POSIX_MADV_WILLNEED);
+    }
 #elif defined(_WIN32)
-        #if _WIN32_WINNT >= 0x602
-        BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    #if _WIN32_WINNT >= 0x602
+    static BOOL (WINAPI *pPrefetchVirtualMemory) (HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG) = []() {
         HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-        if (hKernel32) {
-            pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory");
-            if (pPrefetchVirtualMemory) {
-                std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
-                entries.reserve(ranges.size());
-                for (const auto & range : ranges) {
-                    WIN32_MEMORY_RANGE_ENTRY e;
-                    e.VirtualAddress = (char *) map_addr + range.first;
-                    e.NumberOfBytes  = (SIZE_T) (range.second - range.first);
-                    entries.push_back(e);
-                }
-                if (!entries.empty()) {
-                    pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0);
-                }
-            }
+        return hKernel32 ? (decltype(pPrefetchVirtualMemory))(void *) GetProcAddress(hKernel32, "PrefetchVirtualMemory") : nullptr;
+    }();
+
+    if (pPrefetchVirtualMemory && !ranges.empty()) {
+        std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
+        entries.reserve(ranges.size());
+        for (const auto & range : ranges) {
+            WIN32_MEMORY_RANGE_ENTRY e;
+            e.VirtualAddress = (char *) map_addr + range.first;
+            e.NumberOfBytes  = (SIZE_T) (range.second - range.first);
+            entries.push_back(e);
         }
-        #endif
+        if (!entries.empty()) {
+            pPrefetchVirtualMemory(GetCurrentProcess(), (ULONG_PTR) entries.size(), entries.data(), 0);
+        }
+    }
+    #endif
 #endif
-        // Touch the row headers to ensure page tables are committed and resident in CPU cache
-        for (size_t i = 0; i < rows_copy.size(); ++i) {
-            if (rows_copy[i] >= 0) {
-                const char * r_ptr = (const char *) base + (size_t) rows_copy[i] * stride;
-                if (r_ptr >= (const char *) map_addr && r_ptr + row_size <= (const char *) map_addr + map_size) {
-                    volatile char dummy = *r_ptr;
-                    (void) dummy;
-                }
-            }
-        }
-    }).detach();
 }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
