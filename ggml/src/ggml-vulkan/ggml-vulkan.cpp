@@ -4646,7 +4646,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         GGML_TYPE_Q2_K, GGML_TYPE_TQ2_0, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
     };
 
-#define FOR_EACH_LUT_TYPE(X) \
+#define FOR_EACH_LUT_TYPE_NONFP4(X) \
     X(GGML_TYPE_IQ1_S,   iq1_s)   \
     X(GGML_TYPE_IQ1_M,   iq1_m)   \
     X(GGML_TYPE_IQ2_XXS, iq2_xxs) \
@@ -4655,12 +4655,13 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     X(GGML_TYPE_IQ3_XXS, iq3_xxs) \
     X(GGML_TYPE_IQ3_S,   iq3_s)   \
     X(GGML_TYPE_IQ4_XS,  iq4_xs)  \
-    X(GGML_TYPE_IQ4_NL,  iq4_nl)  \
-    X(GGML_TYPE_MXFP4,   mxfp4)   \
-    X(GGML_TYPE_NVFP4,   nvfp4)
+    X(GGML_TYPE_IQ4_NL,  iq4_nl)
 #define FOR_EACH_LUT_FP4_TYPE(X) \
     X(GGML_TYPE_MXFP4,   mxfp4)   \
     X(GGML_TYPE_NVFP4,   nvfp4)
+#define FOR_EACH_LUT_TYPE(X) \
+    FOR_EACH_LUT_TYPE_NONFP4(X)  \
+    FOR_EACH_LUT_FP4_TYPE(X)
 
     const int mul_mat_id_param_count = 5;
 
@@ -4772,8 +4773,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
               create_mm_pipelines({TYPE, GGML_TYPE_F16, false, true},  tc, "matmul_" #tstr "_f16_f16acc", matmul_##tstr##_f16_f16acc_cm2_len, matmul_##tstr##_f16_f16acc_cm2_data, sizeof(vk_mat_mat_push_constants), 3, cm2_spec, true); \
               create_mm_pipelines({TYPE, GGML_TYPE_F16, false, false}, tc, "matmul_" #tstr "_f16",        matmul_##tstr##_f16_cm2_len,        matmul_##tstr##_f16_cm2_data,        sizeof(vk_mat_mat_push_constants), 3, cm2_spec, true); \
           } }
-        FOR_EACH_LUT_TYPE(X_CM2)
-#undef X_CM2
+        FOR_EACH_LUT_TYPE_NONFP4(X_CM2)
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
 #define X_CM2_OCP(TYPE, tstr) \
@@ -4784,8 +4784,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
               } }
             FOR_EACH_LUT_FP4_TYPE(X_CM2_OCP)
 #undef X_CM2_OCP
-        }
+        } else
 #endif
+        {
+            FOR_EACH_LUT_FP4_TYPE(X_CM2)
+        }
+#undef X_CM2
 
         GGML_ASSERT(device->subgroup_ballot);
 
@@ -4814,8 +4818,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
               create_mm_pipelines({TYPE, GGML_TYPE_F16, true, true},  tc, "matmul_id_subgroup_" #tstr "_f16_f16acc", matmul_id_subgroup_##tstr##_f16_f16acc_cm2_len, matmul_id_subgroup_##tstr##_f16_f16acc_cm2_data, sizeof(vk_mat_mat_id_push_constants), 5, cm2_spec, true); \
               create_mm_pipelines({TYPE, GGML_TYPE_F16, true, false}, tc, "matmul_id_subgroup_" #tstr "_f16",        matmul_id_subgroup_##tstr##_f16_cm2_len,        matmul_id_subgroup_##tstr##_f16_cm2_data,        sizeof(vk_mat_mat_id_push_constants), 5, cm2_spec, true); \
           } }
-        FOR_EACH_LUT_TYPE(X_CM2_ID)
-#undef X_CM2_ID
+        FOR_EACH_LUT_TYPE_NONFP4(X_CM2_ID)
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
 #define X_CM2_ID_OCP(TYPE, tstr) \
@@ -4826,8 +4829,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
               } }
             FOR_EACH_LUT_FP4_TYPE(X_CM2_ID_OCP)
 #undef X_CM2_ID_OCP
-        }
+        } else
 #endif
+        {
+            FOR_EACH_LUT_FP4_TYPE(X_CM2_ID)
+        }
+#undef X_CM2_ID
     } else
 #endif  // defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
@@ -4876,8 +4883,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->coopmat_acc_f32_support) { \
             cm1_create({TYPE, GGML_TYPE_F32, false, false}, tc_mmq, "matmul_" #tstr "_f32",        matmul_##tstr##_f32_cm1_len,        matmul_##tstr##_f32_cm1_data,        sizeof(vk_mat_mat_push_constants), 3); \
         }
-        FOR_EACH_LUT_TYPE(X_CM1)
-#undef X_CM1
+        FOR_EACH_LUT_TYPE_NONFP4(X_CM1)
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
 #define X_CM1_OCP(TYPE, tstr) \
@@ -4889,8 +4895,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             FOR_EACH_LUT_FP4_TYPE(X_CM1_OCP)
 #undef X_CM1_OCP
-        }
+        } else
 #endif
+        {
+            FOR_EACH_LUT_FP4_TYPE(X_CM1)
+        }
+#undef X_CM1
 
         GGML_ASSERT(device->subgroup_ballot);
 
@@ -4923,8 +4933,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         if (device->coopmat_acc_f32_support) { \
             cm1_create({TYPE, GGML_TYPE_F32, true, false}, tc_mmq, "matmul_id_subgroup_" #tstr "_f32",        matmul_id_subgroup_##tstr##_f32_cm1_len,        matmul_id_subgroup_##tstr##_f32_cm1_data,        sizeof(vk_mat_mat_id_push_constants), mul_mat_id_param_count); \
         }
-        FOR_EACH_LUT_TYPE(X_CM1_ID)
-#undef X_CM1_ID
+        FOR_EACH_LUT_TYPE_NONFP4(X_CM1_ID)
 #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
         if (device->ocp_fp4) {
 #define X_CM1_ID_OCP(TYPE, tstr) \
@@ -4936,8 +4945,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
             FOR_EACH_LUT_FP4_TYPE(X_CM1_ID_OCP)
 #undef X_CM1_ID_OCP
-        }
+        } else
 #endif
+        {
+            FOR_EACH_LUT_FP4_TYPE(X_CM1_ID)
+        }
+#undef X_CM1_ID
     } else
 #endif  // defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     {
@@ -5152,6 +5165,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         }
     }
 #undef FOR_EACH_LUT_TYPE
+#undef FOR_EACH_LUT_TYPE_NONFP4
 #undef FOR_EACH_LUT_FP4_TYPE
     // BF16 fallback for coopmat devices without bf16 coopmat support
     if ((device->coopmat2 || device->coopmat_support)
