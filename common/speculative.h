@@ -82,8 +82,14 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
-// informs the speculative context that n_accepted tokens were accepted by the target model
-void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+// informs the speculative context that n_accepted tokens were accepted by the target model.
+// n_accepted_observed can preserve the original acceptance measurement when a
+// rollback implementation has to replay a different number of physical tokens.
+void common_speculative_accept(
+        common_speculative * spec,
+        llama_seq_id         seq_id,
+        uint16_t             n_accepted,
+        int32_t              n_accepted_observed = -1);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

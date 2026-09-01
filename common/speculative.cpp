@@ -159,8 +159,97 @@ struct common_speculative_impl {
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
 
-    common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max) : type(type), n_seq(n_seq), n_max(n_max) {}
+    // Adaptive draft length. The configured n_max is the known-good steady
+    // state. Ordinary tail rejection does not justify shortening because a
+    // wider verification batch is usually cheaper than another target decode
+    // round. Two consecutive drafts accepting fewer than three tokens identify
+    // a real phase change and step the limit down by one. A fully accepted draft
+    // steps it back up by one.
+    std::vector<int32_t> adaptive_limit;
+    std::vector<int32_t> adaptive_floor;
+    std::vector<int32_t> adaptive_ceiling;
+    std::vector<int32_t> n_last_draft;
+    std::vector<uint8_t> early_reject_streak;
+    std::vector<uint8_t> adaptive_limit_reached;
+    bool adaptive_n = false;
 
+    static constexpr int32_t adaptive_productive = 3;
+    static constexpr uint8_t adaptive_patience   = 2;
+
+    void update_adaptive_limit(llama_seq_id seq_id, int32_t n_accepted) {
+        if (!adaptive_n || seq_id < 0 || (size_t) seq_id >= adaptive_limit.size()) {
+            return;
+        }
+        const int32_t n_drafted = n_last_draft[seq_id];
+        if (n_drafted <= 0) {
+            return;
+        }
+        const bool limit_reached = adaptive_limit_reached[seq_id] != 0;
+        adaptive_limit_reached[seq_id] = 0;
+        if (!limit_reached) {
+            // Confidence stopping (p_min), a per-slot cap, or a decode failure
+            // already terminated this draft. Do not reinterpret that shorter
+            // observation as evidence for changing the phase-level ceiling.
+            early_reject_streak[seq_id] = 0;
+            n_last_draft[seq_id] = 0;
+            return;
+        }
+
+        if (n_accepted >= n_drafted) {
+            early_reject_streak[seq_id] = 0;
+            adaptive_limit[seq_id] = std::min(adaptive_ceiling[seq_id], adaptive_limit[seq_id] + 1);
+        } else if (n_accepted >= std::min(adaptive_productive, n_drafted)) {
+            early_reject_streak[seq_id] = 0;
+        } else if (++early_reject_streak[seq_id] >= adaptive_patience) {
+            early_reject_streak[seq_id] = 0;
+            adaptive_limit[seq_id] = std::max(adaptive_floor[seq_id], adaptive_limit[seq_id] - 1);
+        }
+        n_last_draft[seq_id] = 0;
+    }
+
+    // Reset on a new prompt / reused server slot; never mid-generation, since
+    // tracking phase changes within a response is the point of adaptation.
+    void reset_adaptive_limit(llama_seq_id seq_id) {
+        if (seq_id >= 0 && (size_t) seq_id < adaptive_limit.size()) {
+            adaptive_limit[seq_id]       = 0;
+            adaptive_floor[seq_id]       = 1;
+            adaptive_ceiling[seq_id]     = 0;
+            n_last_draft[seq_id]         = 0;
+            early_reject_streak[seq_id]  = 0;
+            adaptive_limit_reached[seq_id] = 0;
+        }
+    }
+
+    void record_adaptive_draft(llama_seq_id seq_id, size_t n_drafted) {
+        if (adaptive_n && seq_id >= 0 && (size_t) seq_id < n_last_draft.size()) {
+            n_last_draft[seq_id] = static_cast<int32_t>(n_drafted);
+            adaptive_limit_reached[seq_id] = n_drafted >= (size_t) adaptive_limit[seq_id];
+        }
+    }
+
+    // effective draft length for this step, never above the configured n_max
+    int32_t adaptive_n_draft(llama_seq_id seq_id, int32_t n_cfg, int32_t n_min) {
+        if (!adaptive_n || n_cfg <= 0 || seq_id < 0 || (size_t) seq_id >= adaptive_limit.size()) {
+            return n_cfg;
+        }
+        adaptive_floor[seq_id]   = std::clamp(n_min, 1, n_cfg);
+        adaptive_ceiling[seq_id] = n_cfg;
+        if (adaptive_limit[seq_id] <= 0) {
+            adaptive_limit[seq_id] = n_cfg;
+        }
+        adaptive_limit[seq_id] = std::clamp(adaptive_limit[seq_id], adaptive_floor[seq_id], n_cfg);
+        return adaptive_limit[seq_id];
+    }
+
+    common_speculative_impl(common_speculative_type type, uint32_t n_seq, int32_t n_max)
+        : type(type), n_seq(n_seq), n_max(n_max) {
+        adaptive_limit.assign(n_seq, 0);
+        adaptive_floor.assign(n_seq, 1);
+        adaptive_ceiling.assign(n_seq, 0);
+        n_last_draft.assign(n_seq, 0);
+        early_reject_streak.assign(n_seq, 0);
+        adaptive_limit_reached.assign(n_seq, 0);
+    }
     virtual ~common_speculative_impl() = default;
 
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
@@ -195,6 +284,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         }
 
         SPC_TRC("%s", "adding speculative implementation 'draft-simple'\n");
+        adaptive_n = this->params.adaptive;
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f\n", this->params.n_max, this->params.n_min, this->params.p_min);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -255,8 +345,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         llama_batch_free(batch);
     }
 
-    void begin(llama_seq_id /*seq_id*/, const llama_tokens & /*prompt*/) override {
-        // noop
+    void begin(llama_seq_id seq_id, const llama_tokens & /*prompt*/) override {
+        reset_adaptive_limit(seq_id);
     }
 
     bool process(const llama_batch & batch) override {
@@ -319,6 +409,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 ++i_batch;
 
@@ -348,7 +440,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if ((params.n_max <= (int) result.size()) ||
+                if ((n_draft_eff <= (int) result.size()) ||
                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -458,6 +550,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         , params(params.draft)
     {
         SPC_TRC("%s", "adding speculative implementation 'draft-eagle3'\n");
+        adaptive_n = this->params.adaptive;
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, (int) params.draft.backend_sampling);
 
         auto * ctx_tgt = this->params.ctx_tgt;
@@ -554,6 +647,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        reset_adaptive_limit(seq_id);
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -779,6 +874,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
                 // pre-norm hidden state of this position becomes g_embd for the next step
                 const float * prenorm = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
@@ -810,7 +907,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (n_draft_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -995,6 +1092,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
+        adaptive_n = this->params.adaptive;
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
@@ -1073,6 +1171,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+
+        reset_adaptive_limit(seq_id);
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -1233,7 +1333,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            // DFlash decodes the whole block in one pass, so a shorter block does
+            // not save draft time -- but it does shrink the target's verification
+            // batch, which is where the cost actually is.
+            const int32_t n_draft = adaptive_n_draft(seq_id, params.n_max, params.n_min);
 
             const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
@@ -1411,6 +1514,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
+        adaptive_n = this->params.adaptive;
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
@@ -1498,6 +1602,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+
+        reset_adaptive_limit(seq_id);
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -1702,6 +1808,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                // MTP drafts sequentially, so a shorter draft saves draft passes
+                // as well as target verification work.
+                const int32_t n_draft_eff = adaptive_n_draft(seq_id, params.n_max, params.n_min);
+
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
@@ -1731,7 +1841,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (n_draft_eff <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -2889,6 +2999,7 @@ void common_speculative_draft(common_speculative * spec) {
 
                     // remember which implementation was used
                     spec->impl_last[seq_id] = impl.get();
+                    impl->record_adaptive_draft(seq_id, result.size());
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
@@ -2915,7 +3026,11 @@ void common_speculative_draft(common_speculative * spec) {
     }
 }
 
-void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+void common_speculative_accept(
+        common_speculative * spec,
+        llama_seq_id         seq_id,
+        uint16_t             n_accepted,
+        int32_t              n_accepted_observed) {
     common_speculative_impl * impl = spec->impl_last[seq_id];
 
     if (impl == nullptr) {
@@ -2939,6 +3054,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl->n_acc_tokens += n_accepted;
         }
 
+        impl->update_adaptive_limit(seq_id, n_accepted_observed >= 0 ? n_accepted_observed : n_accepted);
         impl->accept(seq_id, n_accepted, false);
         impl->n_call_accept++;
     }
