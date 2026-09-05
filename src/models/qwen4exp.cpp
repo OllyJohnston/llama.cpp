@@ -629,7 +629,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        // an unmasked MTP export needs a hidden row for every token, so in that case the
+        // gather is deferred until after t_h_nextn is taken below
+        const bool gather_now = !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
+
+        if (il == n_layer - 1 && inp_out_ids && gather_now) {
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -661,14 +665,18 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // so hand them over here, before the mixer. Emitted only when a context asked for them
     // (the draft context of speculative decoding), which leaves the ordinary decode graph
     // byte for byte what it was. ref: deepseek4.cpp, the other hyper-connection MTP.
+    // [n_embd, hc, rows] already has the [n_embd_out, rows] layout the reader expects, and it
+    // carries exactly the right rows either way -- gathered above when masked, ungathered when not.
     if (cparams.embeddings_nextn) {
-        ggml_tensor * flat = ggml_reshape_2d(ctx0, res_hc, hc * n_embd, n_tokens);
-        ggml_tensor * h_nextn = res_hc;
-        if (cparams.embeddings_nextn_masked && inp_out_ids) {
-            h_nextn = ggml_get_rows(ctx0, flat, inp_out_ids);
+        cb(res_hc, "h_nextn", -1);
+        res->t_h_nextn = res_hc;
+
+        // deferred from the last layer: collapse to the output rows now that the export is taken
+        if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+            res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+            res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+            res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
         }
-        cb(h_nextn, "h_nextn", -1);
-        res->t_h_nextn = h_nextn;
     }
 
     // the final mixer is the output norm: there is no separate one
