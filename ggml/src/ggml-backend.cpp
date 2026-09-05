@@ -955,8 +955,23 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             if (src == NULL) {
                 continue;
             }
-            if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            ggml_backend_buffer_t wbuf = src->view_src ? src->view_src->buffer : src->buffer;
+            if (wbuf != NULL && wbuf->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                if (src_backend_id == -1 && !ggml_backend_buffer_is_host(wbuf)) {
+                    // BMOE-SCHED-01: the weight lives in a non-host (device) buffer, but no
+                    // backend both supports the op and the buffer type (e.g. the fused MoE
+                    // kernel rejected the combination). Never let this op fall back to the CPU
+                    // backend: it would dereference the device pointer as host memory and fault
+                    // in an OpenMP worker. Pin it to the backend that owns the buffer type
+                    // instead - the graph compute will pick the unfused kernel there.
+                    for (int b = 0; b < sched->n_backends; b++) {
+                        if (ggml_backend_supports_buft(sched->backends[b], wbuf->buft)) {
+                            SET_CAUSE(tensor, "1.pin");
+                            return b;
+                        }
+                    }
+                }
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
