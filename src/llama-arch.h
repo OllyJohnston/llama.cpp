@@ -685,6 +685,11 @@ enum llm_tensor {
     LLM_TENSOR_NEXTN_EMBED_TOKENS,
     LLM_TENSOR_NEXTN_ENORM,
     LLM_TENSOR_NEXTN_HNORM,
+    // the MTP block's final hyper-connection mixer (the "shared head" of a plain nextn).
+    // exports written after the rename carry hc_head_*; older ones carry shared_head_*
+    LLM_TENSOR_NEXTN_HC_HEAD_NORM,
+    LLM_TENSOR_NEXTN_HC_HEAD_DOWN,
+    LLM_TENSOR_NEXTN_HC_HEAD_UP,
     LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD,
     LLM_TENSOR_NEXTN_SHARED_HEAD_NORM,
     // qwen4exp: the MTP block's shared-head norm is a hyper-connection mixer, so the
